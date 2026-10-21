@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+
+. /etc/profile.d/001-functions
+
+### Idle-sleep (suspendmode off) turns the panel off through sway DPMS rather
+### than bl_power, which only zeroes the brightness and keeps DSI scanning out.
+if [ -z "$(get_setting system.suspend.dpms)" ]; then
+  set_setting system.suspend.dpms 1
+fi

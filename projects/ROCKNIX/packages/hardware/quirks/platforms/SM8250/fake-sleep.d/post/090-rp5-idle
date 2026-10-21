@@ -1,0 +1,7 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+
+# Idle-sleep (suspendmode off): radios back on.
+
+/usr/bin/rp5-sleep idle-post

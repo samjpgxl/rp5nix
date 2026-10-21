@@ -245,6 +245,16 @@ unfreeze_processes() {
   kill -CONT -1
 }
 
+fake_sleep_quirks() {
+  local QUIRK
+  for QUIRK in /usr/lib/autostart/quirks/platforms/"${HW_DEVICE}"/fake-sleep.d/${1}/* \
+               /usr/lib/autostart/quirks/devices/"${QUIRK_DEVICE}"/fake-sleep.d/${1}/*; do
+    [ -x "${QUIRK}" ] || continue
+    ${DEBUG} && log $0 "Running ${QUIRK}"
+    "${QUIRK}"
+  done
+}
+
 do_suspend_actions() {
   disable_leds
   mute_audio
@@ -253,9 +263,11 @@ do_suspend_actions() {
   freeze_processes
   powersave_governors
   [[ "${ENABLE_CORE_PARKING}" == "1" ]] && park_cores
+  fake_sleep_quirks pre
 }
 
 do_resume_actions() {
+  fake_sleep_quirks post
   [[ "${ENABLE_CORE_PARKING}" == "1" ]] && unpark_cores
   restore_governors
   unfreeze_processes

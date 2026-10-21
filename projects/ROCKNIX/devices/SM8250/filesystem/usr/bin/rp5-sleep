@@ -8,6 +8,9 @@
 #                     wakeup sources
 #   rp5-sleep post    after resume: restore, append one line to the sleep log
 #   rp5-sleep log     print the sleep log
+#   rp5-sleep idle-pre / idle-post
+#                     radios off/on for the idle-sleep fallback
+#                     (suspendmode off), called from fake-sleep.d
 #
 # Settings (system.cfg, set_setting <key> 0 to disable):
 #   rp5.sleep.bluetooth_off   1  rfkill-block Bluetooth while asleep
@@ -15,6 +18,7 @@
 #                                (with rp5.sleep.wake_on_charger) the PM8150B
 #                                charger/Type-C to wake the device
 #   rp5.sleep.wake_on_charger 1  keep charger plug-in as a wakeup source
+#   rp5.idle.radios_off       1  idle-sleep: rfkill-block Wi-Fi and Bluetooth
 
 . /etc/profile
 
@@ -132,6 +136,18 @@ bluetooth_restore() {
   rm -f "${STATE}/bluetooth.blocked"
 }
 
+wifi_off() {
+  rfkill list wifi 2>/dev/null | grep -q "Soft blocked: no" || return
+  wifictl pin >/dev/null 2>&1
+  wifictl disable && touch "${STATE}/wifi.blocked"
+}
+
+wifi_restore() {
+  [ -f "${STATE}/wifi.blocked" ] || return
+  wifictl enable
+  rm -f "${STATE}/wifi.blocked"
+}
+
 # Count and duration deltas for the low power modes the SoC reports.
 qcom_delta() {
   [ -s "${STATE}/pre.qcom" ] && [ -s "${STATE}/post.qcom" ] || return
@@ -184,11 +200,22 @@ case "${1}" in
     wakeup_restore
     bluetooth_restore
     ;;
+  idle-pre)
+    mkdir -p "${STATE}"
+    if setting_on rp5.idle.radios_off; then
+      wifi_off
+      bluetooth_off
+    fi
+    ;;
+  idle-post)
+    wifi_restore
+    bluetooth_restore
+    ;;
   log)
     cat "${LOG}" 2>/dev/null
     ;;
   *)
-    echo "usage: ${0##*/} pre|post|log" >&2
+    echo "usage: ${0##*/} pre|post|idle-pre|idle-post|log" >&2
     exit 1
     ;;
 esac
