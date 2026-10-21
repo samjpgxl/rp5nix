@@ -1,0 +1,194 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+
+# SM8250 suspend helper, called from the platform sleep.d hooks.
+#
+#   rp5-sleep pre     before suspend: snapshot counters, quiesce radios and
+#                     wakeup sources
+#   rp5-sleep post    after resume: restore, append one line to the sleep log
+#   rp5-sleep log     print the sleep log
+#
+# Settings (system.cfg, set_setting <key> 0 to disable):
+#   rp5.sleep.bluetooth_off   1  rfkill-block Bluetooth while asleep
+#   rp5.sleep.wakeup_filter   1  RP5 only: allow only the power key, RTC and
+#                                (with rp5.sleep.wake_on_charger) the PM8150B
+#                                charger/Type-C to wake the device
+#   rp5.sleep.wake_on_charger 1  keep charger plug-in as a wakeup source
+
+. /etc/profile
+
+STATE="/run/rp5-sleep"
+LOG="/storage/.config/rp5nix/sleep.log"
+LOG_LINES=500
+
+setting_on() {
+  [ "$(get_setting "${1}")" != "0" ]
+}
+
+battery_dir() {
+  local PSY
+  for PSY in /sys/class/power_supply/*; do
+    [ "$(cat "${PSY}/type" 2>/dev/null)" = "Battery" ] && echo "${PSY}" && return
+  done
+}
+
+mount_debugfs() {
+  [ -d /sys/kernel/debug/qcom_stats ] || mount -t debugfs none /sys/kernel/debug 2>/dev/null
+}
+
+# "name count ticks" per qcom_stats entry; ticks are 19.2 MHz.
+qcom_stats() {
+  local F
+  mount_debugfs
+  for F in /sys/kernel/debug/qcom_stats/*; do
+    [ -f "${F}" ] || continue
+    awk -v n="${F##*/}" '/^Count:/ {c=$2} /^Accumulated Duration:/ {d=$3}
+      END {if (c != "") print n, c, d+0}' "${F}" 2>/dev/null
+  done
+}
+
+# "name wakeup_count" per wakeup source.
+wakeup_counts() {
+  local W
+  for W in /sys/class/wakeup/wakeup*; do
+    [ -r "${W}/name" ] || continue
+    echo "$(cat "${W}/name") $(cat "${W}/wakeup_count" 2>/dev/null || echo 0)"
+  done
+}
+
+snapshot() {
+  local BAT
+  BAT="$(battery_dir)"
+  mkdir -p "${STATE}"
+  {
+    echo "TIME=$(date +%s)"
+    echo "CAPACITY=$(cat "${BAT}/capacity" 2>/dev/null)"
+    echo "VOLTAGE=$(cat "${BAT}/voltage_now" 2>/dev/null)"
+    echo "SUCCESS=$(cat /sys/power/suspend_stats/success 2>/dev/null)"
+    echo "FAIL=$(cat /sys/power/suspend_stats/fail 2>/dev/null)"
+  } >"${STATE}/${1}.env"
+  qcom_stats >"${STATE}/${1}.qcom"
+  wakeup_counts >"${STATE}/${1}.wakeup"
+}
+
+is_rp5() {
+  case "$(tr -d '\0' </sys/firmware/devicetree/base/model 2>/dev/null)" in
+    "Retroid Pocket 5"*) return 0 ;;
+  esac
+  return 1
+}
+
+wakeup_keep() {
+  case "${1}" in
+    *pwrkey*|*rtc*|*alarmtimer*|*lid*|*hall*) return 0 ;;
+    *pm8150b*|*charger*|*typec*)
+      setting_on rp5.sleep.wake_on_charger && return 0 ;;
+  esac
+  return 1
+}
+
+wakeup_filter() {
+  local S W DEV LIST="" KEY=0
+  for S in /sys/class/wakeup/wakeup*/device; do
+    DEV="$(readlink -f "${S}")"
+    W="${DEV}/power/wakeup"
+    [ "$(cat "${W}" 2>/dev/null)" = "enabled" ] || continue
+    if wakeup_keep "${DEV}"; then
+      case "${DEV}" in *pwrkey*) KEY=1 ;; esac
+    else
+      LIST="${LIST} ${W}"
+    fi
+  done
+
+  # Never leave the device without a way to wake up.
+  if [ "${KEY}" != "1" ]; then
+    log "$0" "No enabled power key wakeup source found, not filtering."
+    return
+  fi
+
+  for W in ${LIST}; do
+    echo disabled >"${W}" 2>/dev/null && echo "${W}" >>"${STATE}/wakeup.disabled"
+  done
+}
+
+wakeup_restore() {
+  local W
+  [ -f "${STATE}/wakeup.disabled" ] || return
+  while read -r W; do
+    echo enabled >"${W}" 2>/dev/null
+  done <"${STATE}/wakeup.disabled"
+  rm -f "${STATE}/wakeup.disabled"
+}
+
+bluetooth_off() {
+  rfkill list bluetooth 2>/dev/null | grep -q "Soft blocked: no" || return
+  rfkill block bluetooth && touch "${STATE}/bluetooth.blocked"
+}
+
+bluetooth_restore() {
+  [ -f "${STATE}/bluetooth.blocked" ] || return
+  rfkill unblock bluetooth
+  rm -f "${STATE}/bluetooth.blocked"
+}
+
+# Count and duration deltas for the low power modes the SoC reports.
+qcom_delta() {
+  [ -s "${STATE}/pre.qcom" ] && [ -s "${STATE}/post.qcom" ] || return
+  awk 'NR==FNR {c[$1]=$2; d[$1]=$3; next}
+       ($1 in c) {printf "%s=%d/%ds ", $1, $2-c[$1], ($3-d[$1])/19200000}' \
+    "${STATE}/pre.qcom" "${STATE}/post.qcom"
+}
+
+woken_by() {
+  local IRQ
+  awk 'NR==FNR {c[$1]=$2; next} ($1 in c) && $2 > c[$1] {printf "%s ", $1}' \
+    "${STATE}/pre.wakeup" "${STATE}/post.wakeup" 2>/dev/null
+  IRQ="$(cat /sys/power/pm_wakeup_irq 2>/dev/null)"
+  [ -n "${IRQ}" ] && printf "irq%s(%s) " "${IRQ}" \
+    "$(awk -v i="${IRQ}:" '$1 == i {print $NF}' /proc/interrupts)"
+}
+
+log_sleep() {
+  local SLEPT DROP RATE LINE
+  # shellcheck disable=SC1091
+  . "${STATE}/pre.env"
+  local T0="${TIME}" C0="${CAPACITY}" S0="${SUCCESS}" F0="${FAIL}"
+  # shellcheck disable=SC1091
+  . "${STATE}/post.env"
+
+  SLEPT=$(( TIME - T0 ))
+  DROP=$(( ${C0:-0} - ${CAPACITY:-0} ))
+  RATE="-"
+  [ "${SLEPT}" -ge 600 ] && RATE="$(awk -v d="${DROP}" -v s="${SLEPT}" 'BEGIN {printf "%.2f", d*3600/s}')"
+
+  LINE="$(date '+%F %T') slept=${SLEPT}s bat=${C0}->${CAPACITY}% rate=${RATE}%/h"
+  LINE="${LINE} ok=$(( ${SUCCESS:-0} - ${S0:-0} )) fail=$(( ${FAIL:-0} - ${F0:-0} ))"
+  LINE="${LINE} $(qcom_delta)wake=[$(woken_by | sed 's/ $//')]"
+
+  mkdir -p "${LOG%/*}"
+  echo "${LINE}" >>"${LOG}"
+  tail -n ${LOG_LINES} "${LOG}" >"${LOG}.tmp" && mv "${LOG}.tmp" "${LOG}"
+}
+
+case "${1}" in
+  pre)
+    mkdir -p "${STATE}"
+    rm -f "${STATE}/wakeup.disabled"
+    setting_on rp5.sleep.bluetooth_off && bluetooth_off
+    is_rp5 && setting_on rp5.sleep.wakeup_filter && wakeup_filter
+    snapshot pre
+    ;;
+  post)
+    [ -f "${STATE}/pre.env" ] && snapshot post && log_sleep
+    wakeup_restore
+    bluetooth_restore
+    ;;
+  log)
+    cat "${LOG}" 2>/dev/null
+    ;;
+  *)
+    echo "usage: ${0##*/} pre|post|log" >&2
+    exit 1
+    ;;
+esac

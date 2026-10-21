@@ -1,0 +1,247 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+
+# Suspend the device for a fixed time, then report whether it really slept,
+# what woke it, how deep the SoC went and what came back after resume.
+#
+#   rp5-sleepcheck [-t seconds] [-n cycles] [--raw]
+#   rp5-sleepcheck --log
+#
+#   -t     seconds to sleep per cycle, woken by the RTC (default 60)
+#   -n     number of suspend/resume cycles (default 1)
+#   --raw  write /sys/power/state directly, skipping the systemd sleep hooks
+#   --log  print the per-sleep log written by the hooks on every real suspend
+#
+# Over SSH the Wi-Fi drops while asleep, so run it detached and read the
+# report afterwards:
+#   nohup rp5-sleepcheck -t 120 -n 3 >/dev/null 2>&1 &
+#   cat /storage/rp5-sleepcheck.txt
+
+SECONDS_ASLEEP=60
+CYCLES=1
+RAW=0
+REPORT="/storage/rp5-sleepcheck.txt"
+RTC="/sys/class/rtc/rtc0"
+WORK="/run/rp5-sleepcheck"
+RESULT=0
+
+while [ $# -gt 0 ]; do
+  case "${1}" in
+    -t) SECONDS_ASLEEP="${2}"; shift ;;
+    -n) CYCLES="${2}"; shift ;;
+    --raw) RAW=1 ;;
+    --log) exec rp5-sleep log ;;
+    *) sed -n '7,20p' "${0}" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  esac
+  shift
+done
+
+case "${SECONDS_ASLEEP}${CYCLES}" in
+  *[!0-9]*|"") echo "-t and -n take whole numbers" >&2; exit 1 ;;
+esac
+
+if [ "$(id -u)" != "0" ]; then
+  echo "Run as root." >&2
+  exit 1
+fi
+
+exec > >(tee "${REPORT}") 2>&1
+mkdir -p "${WORK}"
+
+say() { printf '%s\n' "$*"; }
+result() {
+  # 0 PASS, 1 WARN, 2 FAIL; the summary keeps the worst one
+  say "  [$(echo PASS WARN FAIL | cut -d' ' -f$(( ${1} + 1 )))] ${2}"
+  [ "${1}" -gt "${RESULT}" ] && RESULT="${1}"
+}
+
+battery_dir() {
+  local PSY
+  for PSY in /sys/class/power_supply/*; do
+    [ "$(cat "${PSY}/type" 2>/dev/null)" = "Battery" ] && echo "${PSY}" && return
+  done
+}
+
+stat_get() { cat "/sys/power/suspend_stats/${1}" 2>/dev/null || echo 0; }
+
+snapshot() {
+  local F W
+  {
+    echo "$(date +%s) $(cat "${BAT}/capacity" 2>/dev/null || echo 0) $(cat "${BAT}/voltage_now" 2>/dev/null || echo 0)"
+  } >"${WORK}/${1}.bat"
+  for F in /sys/kernel/debug/qcom_stats/*; do
+    [ -f "${F}" ] || continue
+    awk -v n="${F##*/}" '/^Count:/ {c=$2} /^Accumulated Duration:/ {d=$3}
+      END {if (c != "") print n, c, d+0}' "${F}"
+  done >"${WORK}/${1}.qcom" 2>/dev/null
+  for W in /sys/class/wakeup/wakeup*; do
+    [ -r "${W}/name" ] && echo "$(cat "${W}/name") $(cat "${W}/wakeup_count" 2>/dev/null || echo 0)"
+  done >"${WORK}/${1}.wakeup"
+}
+
+qcom_delta() {
+  awk -v want="${1}" 'NR==FNR {c[$1]=$2; d[$1]=$3; next}
+    $1 == want {printf "%d %d", $2-c[$1], ($3-d[$1])/19200000}' \
+    "${WORK}/pre.qcom" "${WORK}/post.qcom"
+}
+
+wait_for_resume() {
+  local START i
+  START=$(date +%s)
+  # Our process is frozen while asleep, so this loop resumes with the system.
+  while [ $(( $(date +%s) - START )) -lt $(( SECONDS_ASLEEP + 120 )) ]; do
+    [ $(( $(stat_get success) + $(stat_get fail) )) -ne "${1}" ] && break
+    sleep 1
+  done
+  # Let the post-resume hooks finish before looking at the system.
+  for i in $(seq 1 30); do
+    systemctl -q is-active systemd-suspend.service 2>/dev/null || break
+    sleep 1
+  done
+  sleep 2
+}
+
+header() {
+  say "rp5-sleepcheck $(date '+%F %T')"
+  say "model:       $(tr -d '\0' </sys/firmware/devicetree/base/model 2>/dev/null)"
+  say "kernel:      $(uname -r)"
+  say "mem_sleep:   $(cat /sys/power/mem_sleep 2>/dev/null)"
+  say "state:       $(cat /sys/power/state 2>/dev/null)"
+  say "suspendmode: $(get_setting system.suspendmode 2>/dev/null)"
+  say "sleep.conf:  $(grep -h '^SuspendState\|^AllowSuspend' /etc/systemd/sleep.conf.d/*.conf 2>/dev/null | xargs)"
+  say "gamepad MCU off in suspend: $(cat /sys/module/retroid/parameters/suspend_power_off 2>/dev/null || echo n/a)"
+  say "battery:     $(cat "${BAT}/capacity" 2>/dev/null)% $(cat "${BAT}/status" 2>/dev/null), $(( $(cat "${BAT}/current_now" 2>/dev/null || echo 0) / 1000 )) mA"
+  say "wakeup-enabled devices:"
+  local S
+  for S in /sys/class/wakeup/wakeup*/device; do
+    S="$(readlink -f "${S}")"
+    [ "$(cat "${S}/power/wakeup" 2>/dev/null)" = "enabled" ] && say "  ${S#/sys/devices/}"
+  done
+  say ""
+}
+
+resume_checks() {
+  if grep -q "Retroid Pocket Gamepad" /proc/bus/input/devices 2>/dev/null; then
+    result 0 "gamepad input device present"
+  elif grep -q "retroid" /proc/modules 2>/dev/null; then
+    result 2 "gamepad driver loaded but its input device is gone"
+  fi
+
+  if grep -q "\[" /proc/asound/cards 2>/dev/null; then
+    result 0 "sound card present: $(awk -F'[][]' 'NR==1 {gsub(/ /,"",$2); print $2}' /proc/asound/cards)"
+  else
+    result 2 "no sound card after resume"
+  fi
+
+  local DPMS
+  for DPMS in /sys/class/drm/card*-DSI-*/dpms; do
+    [ -e "${DPMS}" ] || continue
+    if [ "$(cat "${DPMS}")" = "On" ]; then
+      result 0 "panel on"
+    else
+      result 1 "panel dpms is $(cat "${DPMS}") (fine if the UI turns it on later)"
+    fi
+  done
+}
+
+cycle() {
+  local N="${1}" S0 F0 T0 C0 V0 T1 C1 V1 SLEPT ENTERED FAILED CNT DUR SUB
+  say "== cycle ${N}/${CYCLES}: suspend for ${SECONDS_ASLEEP}s"
+
+  S0=$(stat_get success)
+  F0=$(stat_get fail)
+  snapshot pre
+
+  echo 0 >"${RTC}/wakealarm"
+  echo "+${SECONDS_ASLEEP}" >"${RTC}/wakealarm"
+
+  if [ "${RAW}" = "1" ]; then
+    # Returns once the system has resumed, or at once on failure.
+    echo mem >/sys/power/state || say "  writing /sys/power/state failed"
+  elif ! systemctl suspend; then
+    echo 0 >"${RTC}/wakealarm"
+    result 2 "systemctl suspend was refused, check AllowSuspend in sleep.conf"
+    return
+  else
+    wait_for_resume $(( S0 + F0 ))
+  fi
+  echo 0 >"${RTC}/wakealarm" 2>/dev/null
+
+  snapshot post
+  read -r T0 C0 V0 <"${WORK}/pre.bat"
+  read -r T1 C1 V1 <"${WORK}/post.bat"
+  SLEPT=$(( T1 - T0 ))
+  ENTERED=$(( $(stat_get success) - S0 ))
+  FAILED=$(( $(stat_get fail) - F0 ))
+
+  if [ "${ENTERED}" -ge 1 ] && [ "${FAILED}" -eq 0 ]; then
+    result 0 "suspend entered and resumed (${SLEPT}s wall time)"
+  else
+    result 2 "suspend did not complete: success +${ENTERED}, fail +${FAILED}"
+    say "    last failed device: $(stat_get last_failed_dev)"
+    say "    last failed errno:  $(stat_get last_failed_errno)"
+    say "    last failed step:   $(stat_get last_failed_step)"
+    dmesg | grep -iE "PM: |suspend|freez|abort|wakeup" | tail -n 15 | sed 's/^/    /'
+  fi
+
+  if [ "${SLEPT}" -lt $(( SECONDS_ASLEEP - 2 )) ]; then
+    result 1 "woke after ${SLEPT}s instead of ${SECONDS_ASLEEP}s"
+  fi
+
+  SUB="$(awk 'NR==FNR {c[$1]=$2; next} ($1 in c) && $2 > c[$1] {printf "%s(+%d) ", $1, $2-c[$1]}' \
+         "${WORK}/pre.wakeup" "${WORK}/post.wakeup")"
+  say "  wakeup sources that fired: ${SUB:-none}"
+  say "  last wakeup irq: $(cat /sys/power/pm_wakeup_irq 2>/dev/null || echo n/a)"
+
+  if [ "${ENTERED}" -lt 1 ]; then
+    :
+  elif [ -s "${WORK}/pre.qcom" ]; then
+    read -r CNT DUR <<<"$(qcom_delta aosd)"
+    if [ "${CNT:-0}" -gt 0 ]; then
+      result 0 "AOSS sleep (deepest SoC state) entered ${CNT}x, ${DUR}s"
+    else
+      read -r CNT DUR <<<"$(qcom_delta cxsd)"
+      if [ "${CNT:-0}" -gt 0 ]; then
+        result 1 "CX collapse entered ${CNT}x (${DUR}s) but AOSS sleep was never reached"
+      else
+        result 2 "SoC never reached CX collapse or AOSS sleep: a device kept a power vote"
+      fi
+    fi
+    say "  low power counters (count/seconds):"
+    awk 'NR==FNR {c[$1]=$2; d[$1]=$3; next} ($1 in c) {
+           printf "    %-12s +%d / %ds\n", $1, $2-c[$1], ($3-d[$1])/19200000}' \
+      "${WORK}/pre.qcom" "${WORK}/post.qcom"
+  else
+    result 1 "no /sys/kernel/debug/qcom_stats, cannot tell how deep the SoC slept"
+  fi
+
+  say "  battery: ${C0}% -> ${C1}%, $(( (V0 - V1) / 1000 )) mV drop"
+  resume_checks
+  say ""
+}
+
+. /etc/profile >/dev/null 2>&1
+BAT="$(battery_dir)"
+[ -d /sys/kernel/debug/qcom_stats ] || mount -t debugfs none /sys/kernel/debug 2>/dev/null
+
+header
+
+if [ ! -e "${RTC}/wakealarm" ]; then
+  say "No RTC wakealarm at ${RTC}, cannot time the test."
+  exit 1
+fi
+if [ "${RAW}" = "0" ] && [ "$(get_setting system.suspendmode)" = "off" ]; then
+  say "Hardware suspend is disabled (suspendmode off, idle-sleep only)."
+  say "Use --raw to test the kernel suspend path anyway."
+  exit 1
+fi
+
+for i in $(seq 1 "${CYCLES}"); do
+  cycle "${i}"
+done
+
+say "== summary: $(echo PASS WARN FAIL | cut -d' ' -f$(( RESULT + 1 )))"
+say "Per-sleep history (real suspends): rp5-sleepcheck --log"
+say "Report saved to ${REPORT}"
+exit "${RESULT}"
