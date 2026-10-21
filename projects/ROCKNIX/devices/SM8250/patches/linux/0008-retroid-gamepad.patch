@@ -26,7 +26,7 @@ diff -rupbN linux.orig/drivers/input/joystick/Makefile linux/drivers/input/joyst
 diff -rupbN linux.orig/drivers/input/joystick/retroid.c linux/drivers/input/joystick/retroid.c
 --- linux.orig/drivers/input/joystick/retroid.c	1970-01-01 00:00:00.000000000 +0000
 +++ linux/drivers/input/joystick/retroid.c	2024-12-18 16:08:54
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,554 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Driver for Retroid Pocket Gamepad
@@ -38,6 +38,7 @@ diff -rupbN linux.orig/drivers/input/joystick/retroid.c linux/drivers/input/joys
 + */
 +
 +#include <linux/delay.h>
++#include <linux/devm-helpers.h>
 +#include <linux/errno.h>
 +#include <linux/gpio/consumer.h>
 +#include <linux/init.h>
@@ -46,6 +47,7 @@ diff -rupbN linux.orig/drivers/input/joystick/retroid.c linux/drivers/input/joys
 +#include <linux/module.h>
 +#include <linux/moduleparam.h>
 +#include <linux/of.h>
++#include <linux/pm.h>
 +#include <linux/serdev.h>
 +#include <linux/slab.h>
 +#include <uapi/linux/sched/types.h>
@@ -88,10 +90,18 @@ diff -rupbN linux.orig/drivers/input/joystick/retroid.c linux/drivers/input/joys
 +	struct gpio_desc *enable_gpio;
 +	struct gpio_desc *reset_gpio;
 +	struct input_dev *dev_input;
++	struct serdev_device *serdev;
++	struct work_struct resume_work;
++	bool powered_off;
 +};
 +
 +
 +static int update_params=0;
++
++/* Hold the MCU in reset with its enable line low across system suspend. */
++static bool suspend_power_off = true;
++module_param(suspend_power_off, bool, 0644);
++MODULE_PARM_DESC(suspend_power_off, "Power off the gamepad MCU during system suspend");
 +
 +static int trigger_left_max=0x610;
 +static int trigger_left_deadzone=0x0;
@@ -219,6 +229,34 @@ diff -rupbN linux.orig/drivers/input/joystick/retroid.c linux/drivers/input/joys
 +	msleep(100);
 +}
 +
++static void gamepad_mcu_power_on(struct gamepad_device *gamepad_dev)
++{
++	if (gamepad_dev->boot_gpio)
++		gpiod_set_value_cansleep(gamepad_dev->boot_gpio, 0);
++
++	if (gamepad_dev->reset_gpio)
++		gpiod_set_value_cansleep(gamepad_dev->reset_gpio, 0);
++
++	msleep(100);
++
++	if (gamepad_dev->enable_gpio)
++		gpiod_set_value_cansleep(gamepad_dev->enable_gpio, 1);
++
++	if (gamepad_dev->reset_gpio)
++		gpiod_set_value_cansleep(gamepad_dev->reset_gpio, 1);
++
++	msleep(100);
++}
++
++static void gamepad_mcu_power_off(struct gamepad_device *gamepad_dev)
++{
++	if (gamepad_dev->reset_gpio)
++		gpiod_set_value_cansleep(gamepad_dev->reset_gpio, 0);
++
++	if (gamepad_dev->enable_gpio)
++		gpiod_set_value_cansleep(gamepad_dev->enable_gpio, 0);
++}
++
 +static void gamepad_input_handler(struct gamepad_device *dev,
 +				  struct gamepad_data *data)
 +{
@@ -320,6 +358,16 @@ diff -rupbN linux.orig/drivers/input/joystick/retroid.c linux/drivers/input/joys
 +	}
 +}
 +
++static void gamepad_resume_work(struct work_struct *work)
++{
++	struct gamepad_device *gamepad_dev =
++		container_of(work, struct gamepad_device, resume_work);
++
++	gamepad_mcu_power_on(gamepad_dev);
++	gamepad_send_init_sequence(gamepad_dev->serdev);
++	gamepad_dev->powered_off = false;
++}
++
 +static size_t gamepad_mcu_uart_rx_bytes(struct serdev_device *serdev,
 +					const u8 *data, size_t count)
 +{
@@ -394,26 +442,13 @@ diff -rupbN linux.orig/drivers/input/joystick/retroid.c linux/drivers/input/joys
 +		dev_warn(dev, "Unable to get reset gpio: %d\n", ret);
 +	}
 +
-+	if (gamepad_dev->boot_gpio)
-+		gpiod_set_value_cansleep(gamepad_dev->boot_gpio, 0);
-+
-+	if (gamepad_dev->reset_gpio)
-+		gpiod_set_value_cansleep(gamepad_dev->reset_gpio, 0);
-+
-+	msleep(100);
-+
-+	if (gamepad_dev->enable_gpio)
-+		gpiod_set_value_cansleep(gamepad_dev->enable_gpio, 1);
-+
-+	if (gamepad_dev->reset_gpio)
-+		gpiod_set_value_cansleep(gamepad_dev->reset_gpio, 1);
-+
-+	msleep(100);
++	gamepad_mcu_power_on(gamepad_dev);
 +
 +	ret = devm_serdev_device_open(dev, serdev);
 +	if (ret)
 +		return dev_err_probe(dev, ret, "Unable to open UART device\n");
 +	gamepad_dev->dev = dev;
++	gamepad_dev->serdev = serdev;
 +
 +	serdev_device_set_drvdata(serdev, gamepad_dev);
 +
@@ -487,8 +522,41 @@ diff -rupbN linux.orig/drivers/input/joystick/retroid.c linux/drivers/input/joys
 +
 +	gamepad_send_init_sequence(serdev);
 +
++	ret = devm_work_autocancel(dev, &gamepad_dev->resume_work,
++				   gamepad_resume_work);
++	if (ret)
++		return ret;
++
 +	return 0;
 +}
++
++static int gamepad_suspend(struct device *dev)
++{
++	struct gamepad_device *gamepad_dev = dev_get_drvdata(dev);
++
++	cancel_work_sync(&gamepad_dev->resume_work);
++
++	if (!suspend_power_off)
++		return 0;
++
++	gamepad_mcu_power_off(gamepad_dev);
++	gamepad_dev->powered_off = true;
++
++	return 0;
++}
++
++static int gamepad_resume(struct device *dev)
++{
++	struct gamepad_device *gamepad_dev = dev_get_drvdata(dev);
++
++	/* The MCU takes ~0.8s to boot and accept its init sequence. */
++	if (gamepad_dev->powered_off)
++		schedule_work(&gamepad_dev->resume_work);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(gamepad_pm_ops, gamepad_suspend, gamepad_resume);
 +
 +static const struct of_device_id gamepad_mcu_uart_of_match[] = {
 +	{ .compatible = "retroid,retroid-pocket-gamepad" },
@@ -500,6 +568,7 @@ diff -rupbN linux.orig/drivers/input/joystick/retroid.c linux/drivers/input/joys
 +	.driver = {
 +		.name = DRIVER_NAME,
 +		.of_match_table = gamepad_mcu_uart_of_match,
++		.pm = pm_sleep_ptr(&gamepad_pm_ops),
 +	},
 +	.probe = gamepad_mcu_uart_probe,
 +};
