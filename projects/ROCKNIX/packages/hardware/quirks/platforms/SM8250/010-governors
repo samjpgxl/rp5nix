@@ -2,7 +2,24 @@
 # SPDX-License-Identifier: GPL-2.0
 # Copyright (C) 2024 ROCKNIX (https://github.com/ROCKNIX)
 
+. /etc/profile.d/001-functions
+
 cat <<EOF >/storage/.config/profile.d/010-governors
 CPU_FREQ=("/sys/devices/system/cpu/cpufreq/policy0" "/sys/devices/system/cpu/cpufreq/policy4" "/sys/devices/system/cpu/cpufreq/policy7")
 GPU_FREQ=("/sys/devices/platform/soc@0/3d00000.gpu/devfreq/3d00000.gpu")
 EOF
+
+### Default the CPU governor to schedutil. The DT gives every core a
+### capacity and power coefficient, so with schedutil the scheduler uses the
+### energy model to keep light work on the A55 cluster at low OPPs, where
+### ondemand jumps to the top OPP whenever load crosses its threshold. Platform
+### quirks run before 008-perfmode, so this seeds the setting before it would
+### persist ondemand. Installs that already got that ondemand default are
+### moved over once; a governor chosen afterwards is kept.
+if [ -z "$(get_setting system.cpugovernor)" ]; then
+  set_setting system.cpugovernor schedutil
+elif [ -z "$(get_setting rp5nix.governor.migrated)" ] && \
+     [ "$(get_setting system.cpugovernor)" = "ondemand" ]; then
+  set_setting system.cpugovernor schedutil
+fi
+set_setting rp5nix.governor.migrated 1
