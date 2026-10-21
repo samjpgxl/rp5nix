@@ -9,6 +9,8 @@
 #     WSA Playback: ASoC error (-110): at __soc_pcm_open()
 # runtime PM latches the device in the error state and the whole card is unusable.
 #
-# Pinning both amps active from bind keeps the line de-asserted. Matched on the
-# wsa881x SoundWire part ID, which in this tree is the Pocket Max only.
-ACTION=="bind", SUBSYSTEM=="soundwire", KERNEL=="sdw:*:0217:2010:*", ATTR{power/control}="on"
+# Pinning both amps active from bind keeps the line de-asserted. The Retroid
+# boards use the same wsa881x part but give each amp its own powerdown line,
+# so they keep runtime PM and the amps power down when idle and in suspend.
+# Only the MANGMI boards (Pocket Max, Air Y Pro) share the line.
+ACTION=="bind", SUBSYSTEM=="soundwire", KERNEL=="sdw:*:0217:2010:*", PROGRAM="/usr/bin/grep -qs MANGMI /sys/firmware/devicetree/base/model", ATTR{power/control}="on"
