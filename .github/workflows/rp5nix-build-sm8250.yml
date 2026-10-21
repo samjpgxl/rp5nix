@@ -1,0 +1,37 @@
+name: Build SM8250 (rp5nix)
+
+# Builds only the SM8250 image (RP5 and the other SM8250 handhelds).
+#
+# Start it by pushing a tag that starts with rp5nix-, from the commit to build:
+#   git tag rp5nix-20261021 && git push origin rp5nix-20261021
+# or, once this file is on the default branch, from the Actions tab with
+# "Run workflow" (GitHub only lists dispatchable workflows from there).
+#
+# The build container defaults to upstream's public ghcr.io/rocknix image,
+# so the fork needs no package write permission. This fork does not change
+# the Dockerfile; if it ever does, build and publish an image under the
+# fork's owner and pass that owner as build_image_owner.
+
+on:
+  push:
+    tags:
+      - 'rp5nix-*'
+  workflow_dispatch:
+    inputs:
+      build_image_owner:
+        description: 'Owner of ghcr.io/<owner>/rocknix-build:latest'
+        required: false
+        default: 'rocknix'
+        type: string
+
+jobs:
+  build-sm8250:
+    name: SM8250
+    uses: ./.github/workflows/build-device.yml
+    secrets: inherit
+    with:
+      PROJECT: ROCKNIX
+      DEVICE: SM8250
+      OWNER_LC: ${{ inputs.build_image_owner || 'rocknix' }}
+      NIGHTLY: "yes"
+      OFFICIAL: "no"
