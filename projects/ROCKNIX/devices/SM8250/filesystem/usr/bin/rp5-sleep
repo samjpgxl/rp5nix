@@ -197,6 +197,7 @@ case "${1}" in
     ;;
   post)
     [ -f "${STATE}/pre.env" ] && snapshot post && log_sleep
+    rm -f "${STATE}/pre.env"
     wakeup_restore
     bluetooth_restore
     ;;
